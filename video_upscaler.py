@@ -67,7 +67,7 @@ async def decode_frames(start, length, input_file, output_folder):
     ).input(
         input_file,
     ).output(
-        os.path.join(output_folder, "%08d.png"),
+        os.path.join(output_folder, "%06d.png"),
     )
 
     @ffmpeg.on("error")
@@ -78,7 +78,7 @@ async def decode_frames(start, length, input_file, output_folder):
 
 
 async def upscale(
-        input_folder, output_folder, upscaler="waifu2x",
+        input_folder, output_folder, gpu, upscaler="waifu2x",
         upscaler_args=[]):
     if not os.path.exists(input_folder):
         raise RuntimeError(f"Folder {input_folder} does not exist")
@@ -86,49 +86,54 @@ async def upscale(
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    if upscaler == "waifu2x":
-        args = ["-i", input_folder, "-o", output_folder]
-        args.extend(upscaler_args)
+    args = ["-i", input_folder, "-o", output_folder, "-g", gpu]
+    args.extend(upscaler_args)
 
+    if upscaler == "waifu2x":
         cmd = "waifu2x-ncnn-vulkan"
 
         proc = await asyncio.create_subprocess_exec(
                 cmd,
                 *args,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
 
         await proc.wait()
 
         shutil.rmtree(input_folder)
-
-        return proc.returncode
     elif upscaler == "realsr":
-        args = ["-i", input_folder, "-o", output_folder]
-        args.extend(upscaler_args)
-
         cmd = "realsr-ncnn-vulkan"
 
         proc = await asyncio.create_subprocess_exec(
                 cmd,
                 *args,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
 
         await proc.wait()
 
         shutil.rmtree(input_folder)
-
-        return proc.returncode
     else:
         raise NotImplementedError("Upscaler not implemented")
 
+    if proc.returncode != 0:
+        error_lines = []
+        while not proc.stderr.at_eof():
+            error_lines.append((await proc.stderr.readline()).decode())
+        raise RuntimeError("\n".join(error_lines))
 
-async def encode_frames(input_folder, output_file):
-    ffmpeg = FFmpeg().option("y").input(
-        os.path.join(input_folder, "%08d.png"),
+    return gpu
+
+
+async def encode_frames(input_folder, output_file, framerate):
+    ffmpeg = FFmpeg().option(
+        "y",
+    ).option(
+        "-r", framerate,
+    ).input(
+        os.path.join(input_folder, "%06d.png"),
     ).output(
         output_file,
     )
@@ -204,16 +209,9 @@ async def main():
         default=500,
     )
     parser.add_argument(
-        "-j",
-        "-concurrent-tasks",
-        help="Concurrent upscaling tasks",
-        type=int,
-        default=1,
-    )
-    parser.add_argument(
         "-d", "--directory", help="Temp file directory", default="vsrmgr_tmp",
     )
-    parser.add_argument("-s", "--scale", help="Upscale factor", default=2)
+    parser.add_argument("-s", "--scale", help="Upscale factor")
     parser.add_argument(
         "--resume",
         help="Attempt to resume unfinished work "
@@ -229,6 +227,11 @@ async def main():
         "-p",
         "--preview",
         help="Create a preview of upscale (format: 'time,length')",
+    )
+    parser.add_argument(
+        "-g",
+        "--gpu",
+        help="Select specific GPU by id, multiple separated with comma",
     )
 
     args = parser.parse_args()
@@ -246,11 +249,11 @@ async def main():
         )
 
     metadata = pyprobe.VideoFileParser().parseFfprobe(input_vid)
-    fps = metadata["videos"][0]["framerate"]
+    framerate = metadata["videos"][0]["framerate"]
     length = metadata["duration"]
     has_audio = len(metadata["audios"]) > 0
 
-    step_length_s = args.batch_size / fps
+    step_length_s = args.batch_size / framerate
 
     end_index = int(round(length / step_length_s))
 
@@ -290,8 +293,19 @@ async def main():
                 decode_index = i + 1
                 decode_done_index = i + 1
 
+    gpus = args.gpu.split(",")
+
+    gpu_avail = queue.Queue()
+    for gpu in gpus:
+        gpu_avail.put(gpu)
+
+    if not args.scale:
+        scale = 4 if args.realsr else 2
+    else:
+        scale = args.scale
+
     decode_queue = queue.Queue()
-    upscale_queue = queue.Queue(maxsize=args.j)
+    upscale_queue = queue.Queue(maxsize=len(gpus))
     encode_queue = queue.Queue()
 
     if not os.path.exists(args.directory):
@@ -302,7 +316,7 @@ async def main():
 
     while encode_index < end_index:
         while decode_index < end_index and \
-                upscale_index >= decode_index - args.j:
+                upscale_index >= decode_index - len(gpus):
             decode_queue.put(asyncio.create_task(decode_frames(
                 step_length_s * decode_index,
                 step_length_s,
@@ -315,10 +329,11 @@ async def main():
             encode_queue.put(asyncio.create_task(encode_frames(
                 os.path.join(args.directory, f"tmp_out{encode_index}"),
                 os.path.join(args.directory, f"tmp{encode_index}.mp4"),
+                framerate,
             )))
             encode_index += 1
 
-        while decode_done_index < upscale_done_index + args.j and \
+        while decode_done_index < upscale_done_index + len(gpus) and \
                 decode_done_index < decode_index:
             await decode_queue.get()
             decode_done_index += 1
@@ -327,13 +342,14 @@ async def main():
             upscale_queue.put(asyncio.create_task(upscale(
                 os.path.join(args.directory, f"tmp{upscale_index}"),
                 os.path.join(args.directory, f"tmp_out{upscale_index}"),
+                gpu_avail.get(),
                 upscaler="realsr" if args.realsr else "waifu2x",
-                upscaler_args=["scale", str(args.scale)],
+                upscaler_args=["-s", str(scale)],
             )))
             upscale_index += 1
 
         if not upscale_queue.empty():
-            await upscale_queue.get()
+            gpu_avail.put(await upscale_queue.get())
             upscale_done_index += 1
             bar.next()
 

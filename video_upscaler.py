@@ -78,7 +78,7 @@ async def decode_frames(start, length, input_file, output_folder):
 
 
 async def upscale(
-        input_folder, output_folder, gpu, upscaler="waifu2x",
+        input_folder, output_folder, gpu, scale, upscaler="waifu2x",
         upscaler_args=[]):
     if not os.path.exists(input_folder):
         raise RuntimeError(f"Folder {input_folder} does not exist")
@@ -86,18 +86,19 @@ async def upscale(
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    args = ["-i", input_folder, "-o", output_folder, "-g", gpu]
-    args.extend(upscaler_args)
-
     if upscaler == "waifu2x":
         cmd = "waifu2x-ncnn-vulkan"
 
+        args = ["-i", input_folder, "-o", output_folder, "-g", gpu,
+                "-s", str(scale)]
+        args.extend(upscaler_args)
+
         proc = await asyncio.create_subprocess_exec(
-                cmd,
-                *args,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            cmd,
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
         await proc.wait()
 
@@ -105,16 +106,35 @@ async def upscale(
     elif upscaler == "realsr":
         cmd = "realsr-ncnn-vulkan"
 
+        args = ["-i", input_folder, "-o", output_folder, "-g", gpu,
+                "-s", str(scale)]
+        args.extend(upscaler_args)
+
         proc = await asyncio.create_subprocess_exec(
-                cmd,
-                *args,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            cmd,
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
         await proc.wait()
 
         shutil.rmtree(input_folder)
+    elif upscaler == "vkresample":
+        cmd = "VkResample"
+
+        args = ["-ifolder", input_folder, "-ofolder", output_folder, "-d", gpu,
+                "-numfiles", "500", "-numthreads", "8", "-u", str(scale)]
+        args.extend(upscaler_args)
+
+        proc = await asyncio.create_subprocess_exec(
+            cmd,
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        await proc.wait()
     else:
         raise NotImplementedError("Upscaler not implemented")
 
@@ -224,6 +244,11 @@ async def main():
         action="store_true",
     )
     parser.add_argument(
+        "--vkresample",
+        help="Use VkResample instead of Waifu2x",
+        action="store_true",
+    )
+    parser.add_argument(
         "-p",
         "--preview",
         help="Create a preview of upscale (format: 'time,length')",
@@ -232,11 +257,19 @@ async def main():
         "-g",
         "--gpu",
         help="Select specific GPU by id, multiple separated with comma",
+        default="0",
     )
 
     args = parser.parse_args()
 
     input_vid = args.input
+
+    upscaler = "waifu2x"
+
+    if args.realsr:
+        upscaler = "realsr"
+    if args.vkresample:
+        upscaler = "vkresample"
 
     if args.preview:
         prev = args.preview.split(",")
@@ -343,8 +376,9 @@ async def main():
                 os.path.join(args.directory, f"tmp{upscale_index}"),
                 os.path.join(args.directory, f"tmp_out{upscale_index}"),
                 gpu_avail.get(),
-                upscaler="realsr" if args.realsr else "waifu2x",
-                upscaler_args=["-s", str(scale)],
+                scale,
+                upscaler=upscaler,
+                upscaler_args=[],
             )))
             upscale_index += 1
 

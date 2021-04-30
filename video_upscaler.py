@@ -78,93 +78,127 @@ async def decode_frames(start, length, input_file, output_folder):
 
 
 async def upscale(
-        input_folder, output_folder, gpu, scale, upscaler="waifu2x",
-        upscaler_args=[]):
-    if not os.path.exists(input_folder):
-        raise RuntimeError(f"Folder {input_folder} does not exist")
+        task_queue, gpu, scale, args, bar, encode_queue,
+        upscaler="waifu2x", noise=None):
 
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+    while True:
+        index = await task_queue.get()
 
-    if upscaler == "waifu2x":
-        cmd = "waifu2x-ncnn-vulkan"
+        input_folder = os.path.join(args.directory, f"tmp{index}")
+        output_folder = os.path.join(args.directory, f"tmp_out{index}")
+        if not os.path.exists(input_folder):
+            raise RuntimeError(f"Folder {input_folder} does not exist")
 
-        args = ["-i", input_folder, "-o", output_folder, "-g", gpu,
-                "-s", str(scale)]
-        args.extend(upscaler_args)
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
 
-        proc = await asyncio.create_subprocess_exec(
-            cmd,
-            *args,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+        if upscaler == "waifu2x":
+            cmd = "waifu2x-ncnn-vulkan"
+
+            cmd_args = ["-i", input_folder, "-o", output_folder, "-g", gpu,
+                        "-s", str(scale)]
+            if noise:
+                cmd_args.extend(["-n", str(noise)])
+
+            proc = await asyncio.create_subprocess_exec(
+                cmd,
+                *cmd_args,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            await proc.wait()
+
+            shutil.rmtree(input_folder)
+        elif upscaler == "realsr":
+            cmd = "realsr-ncnn-vulkan"
+
+            cmd_args = ["-i", input_folder, "-o", output_folder, "-g", gpu,
+                        "-s", str(scale)]
+
+            proc = await asyncio.create_subprocess_exec(
+                cmd,
+                *cmd_args,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            await proc.wait()
+
+            shutil.rmtree(input_folder)
+        elif upscaler == "srmd":
+            cmd = "srmd-ncnn-vulkan"
+
+            cmd_args = ["-i", input_folder, "-o", output_folder, "-g", gpu,
+                        "-s", str(scale)]
+            if noise:
+                cmd_args.extend(["-n", str(noise)])
+
+            proc = await asyncio.create_subprocess_exec(
+                cmd,
+                *cmd_args,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            await proc.wait()
+
+            shutil.rmtree(input_folder)
+        elif upscaler == "vkresample":
+            cmd = "VkResample"
+
+            cmd_args = ["-ifolder", input_folder, "-ofolder", output_folder,
+                        "-d", gpu, "-numfiles", "500", "-numthreads", "8",
+                        "-u", str(scale)]
+
+            proc = await asyncio.create_subprocess_exec(
+                cmd,
+                *cmd_args,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            await proc.wait()
+        else:
+            raise NotImplementedError("Upscaler not implemented")
+
+        if proc.returncode != 0:
+            error_lines = []
+            while not proc.stderr.at_eof():
+                error_lines.append((await proc.stderr.readline()).decode())
+            raise RuntimeError("\n".join(error_lines))
+
+        await encode_queue.put((
+            os.path.join(args.directory, f"tmp_out{index}"),
+            os.path.join(args.directory, f"tmp{index}.mp4"),
+        ))
+        task_queue.task_done()
+        bar.next()
+
+
+async def encode_frames(encode_queue, framerate):
+    while True:
+        input_folder, output_file = await encode_queue.get()
+
+        ffmpeg = FFmpeg().option(
+            "y",
+        ).option(
+            "-r", framerate,
+        ).input(
+            os.path.join(input_folder, "%06d.png"),
+        ).output(
+            output_file,
         )
 
-        await proc.wait()
+        @ffmpeg.on("error")
+        def on_error(code):
+            _logger.error(f"Error: {code}")
+
+        await ffmpeg.execute()
 
         shutil.rmtree(input_folder)
-    elif upscaler == "realsr":
-        cmd = "realsr-ncnn-vulkan"
 
-        args = ["-i", input_folder, "-o", output_folder, "-g", gpu,
-                "-s", str(scale)]
-        args.extend(upscaler_args)
-
-        proc = await asyncio.create_subprocess_exec(
-            cmd,
-            *args,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        await proc.wait()
-
-        shutil.rmtree(input_folder)
-    elif upscaler == "vkresample":
-        cmd = "VkResample"
-
-        args = ["-ifolder", input_folder, "-ofolder", output_folder, "-d", gpu,
-                "-numfiles", "500", "-numthreads", "8", "-u", str(scale)]
-        args.extend(upscaler_args)
-
-        proc = await asyncio.create_subprocess_exec(
-            cmd,
-            *args,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        await proc.wait()
-    else:
-        raise NotImplementedError("Upscaler not implemented")
-
-    if proc.returncode != 0:
-        error_lines = []
-        while not proc.stderr.at_eof():
-            error_lines.append((await proc.stderr.readline()).decode())
-        raise RuntimeError("\n".join(error_lines))
-
-    return gpu
-
-
-async def encode_frames(input_folder, output_file, framerate):
-    ffmpeg = FFmpeg().option(
-        "y",
-    ).option(
-        "-r", framerate,
-    ).input(
-        os.path.join(input_folder, "%06d.png"),
-    ).output(
-        output_file,
-    )
-
-    @ffmpeg.on("error")
-    def on_error(code):
-        _logger.error(f"Error: {code}")
-
-    await ffmpeg.execute()
-
-    shutil.rmtree(input_folder)
+        encode_queue.task_done()
 
 
 async def combine_video_fragments(output_file, input_fragment_files):
@@ -217,6 +251,25 @@ async def transplant_audio(input_file, audio_file, output_file):
     return proc.returncode
 
 
+async def update_bar(bar, batch_index, batch_size, directory):
+    bi = batch_index
+    i = batch_index * batch_size
+    while True:
+        batch_dir = os.path.join(directory, f"tmp_out{bi}")
+        if os.path.isdir(batch_dir):
+            while os.path.isfile(os.path.join(batch_dir, f"{i+1:06}.png")) and\
+                    i < batch_size:
+                i += 1
+
+            if i >= batch_size:
+                bi += 1
+                i = 0
+
+            bar.goto(bi * batch_size + i)
+
+        await asyncio.sleep(1)
+
+
 async def main():
     parser = argparse.ArgumentParser(description="VSR Manager")
 
@@ -240,12 +293,17 @@ async def main():
     )
     parser.add_argument(
         "--realsr",
-        help="Use RealSR instead of Waifu2x",
+        help="Use RealSR upscaler",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--srmd",
+        help="Use SRMD upscaler",
         action="store_true",
     )
     parser.add_argument(
         "--vkresample",
-        help="Use VkResample instead of Waifu2x",
+        help="Use VkResample upscaler",
         action="store_true",
     )
     parser.add_argument(
@@ -259,6 +317,12 @@ async def main():
         help="Select specific GPU by id, multiple separated with comma",
         default="0",
     )
+    parser.add_argument(
+        "-n",
+        "--noise",
+        help="Denoise level",
+        default=None,
+    )
 
     args = parser.parse_args()
 
@@ -268,7 +332,9 @@ async def main():
 
     if args.realsr:
         upscaler = "realsr"
-    if args.vkresample:
+    elif args.srmd:
+        upscaler = "srmd"
+    elif args.vkresample:
         upscaler = "vkresample"
 
     if args.preview:
@@ -290,107 +356,83 @@ async def main():
 
     end_index = int(round(length / step_length_s))
 
+    num_frames = length * framerate
+
     if not args.resume:
         decode_index = 0
-        decode_done_index = 0
-        upscale_index = 0
-        upscale_done_index = 0
-        encode_index = 0
     else:
         decode_index = -1
-        decode_done_index = -1
-        upscale_index = -1
-        upscale_done_index = -1
-        encode_index = -1
         # Check for existing video fragments
         for i in range(end_index - 1, -1, -1):
             if os.path.isfile(os.path.join(args.directory, f"tmp{i}.mp4")):
-                encode_index = i + 1
-                if upscale_index < 0:
-                    upscale_index = i + 1
-                    upscale_done_index = i + 1
-                if decode_index < 0:
-                    decode_index = i + 1
-                    decode_done_index = i + 1
-                break
-            if upscale_index < 0 and \
-                    os.path.isfile(os.path.join(
-                        args.directory, f"tmp_out{i}/{args.batch_size:08}.png"
-                    )):
-                upscale_index = i + 1
-                upscale_done_index = i + 1
-            if decode_index < 0 and \
-                    os.path.isfile(os.path.join(
-                        args.directory, f"tmp{i}/{args.batch_size:08}.png"
-                    )):
                 decode_index = i + 1
-                decode_done_index = i + 1
+                break
 
     gpus = args.gpu.split(",")
-
-    gpu_avail = queue.Queue()
-    for gpu in gpus:
-        gpu_avail.put(gpu)
 
     if not args.scale:
         scale = 4 if args.realsr else 2
     else:
         scale = args.scale
 
-    decode_queue = queue.Queue()
-    upscale_queue = queue.Queue(maxsize=len(gpus))
-    encode_queue = queue.Queue()
+    upscale_queue = asyncio.Queue(maxsize=2 * len(gpus))
+    encode_queue = asyncio.Queue()
+
+    bar = EtaBar("Progress", index=decode_index * args.batch_size,
+                 max=num_frames)
+    bar.update()
+
+    upscale_workers = []
+
+    for gpu in gpus:
+        upscale_workers.append(asyncio.create_task(upscale(
+            upscale_queue, gpu, scale, args,
+            bar, encode_queue, upscaler=upscaler
+        )))
+
+    encode_worker = asyncio.create_task(encode_frames(
+        encode_queue,
+        framerate,
+    ))
+
+    bar_updater = asyncio.create_task(update_bar(
+        bar,
+        decode_index,
+        args.batch_size,
+        args.directory,
+    ))
 
     if not os.path.exists(args.directory):
         os.makedirs(args.directory)
 
-    bar = EtaBar("Progress", index=upscale_done_index, max=end_index)
-    bar.update()
+    while decode_index < end_index:
+        await decode_frames(
+            step_length_s * decode_index,
+            step_length_s,
+            input_vid,
+            os.path.join(args.directory, f"tmp{decode_index}"),
+        )
+        await upscale_queue.put(
+            decode_index,
+        )
+        decode_index += 1
 
-    while encode_index < end_index:
-        while decode_index < end_index and \
-                upscale_index >= decode_index - len(gpus):
-            decode_queue.put(asyncio.create_task(decode_frames(
-                step_length_s * decode_index,
-                step_length_s,
-                input_vid,
-                os.path.join(args.directory, f"tmp{decode_index}"),
-            )))
-            decode_index += 1
+    await upscale_queue.join()
 
-        while upscale_done_index > encode_index:
-            encode_queue.put(asyncio.create_task(encode_frames(
-                os.path.join(args.directory, f"tmp_out{encode_index}"),
-                os.path.join(args.directory, f"tmp{encode_index}.mp4"),
-                framerate,
-            )))
-            encode_index += 1
+    for worker in upscale_workers:
+        worker.cancel()
 
-        while decode_done_index < upscale_done_index + len(gpus) and \
-                decode_done_index < decode_index:
-            await decode_queue.get()
-            decode_done_index += 1
+    await encode_queue.join()
 
-        while upscale_index < decode_done_index and not upscale_queue.full():
-            upscale_queue.put(asyncio.create_task(upscale(
-                os.path.join(args.directory, f"tmp{upscale_index}"),
-                os.path.join(args.directory, f"tmp_out{upscale_index}"),
-                gpu_avail.get(),
-                scale,
-                upscaler=upscaler,
-                upscaler_args=[],
-            )))
-            upscale_index += 1
-
-        if not upscale_queue.empty():
-            gpu_avail.put(await upscale_queue.get())
-            upscale_done_index += 1
-            bar.next()
-
-    while not encode_queue.empty():
-        await encode_queue.get()
+    bar_updater.cancel()
+    await bar_updater.join()
 
     bar.finish()
+
+    encode_worker.cancel()
+    await encode_worker.join()
+
+    await asyncio.gather(*upscale_workers, return_exceptions=True)
 
     if end_index > 1:
         await combine_video_fragments(

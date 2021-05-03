@@ -425,12 +425,10 @@ async def main():
     await encode_queue.join()
 
     bar_updater.cancel()
-    await bar_updater.join()
 
     bar.finish()
 
     encode_worker.cancel()
-    await encode_worker.join()
 
     await asyncio.gather(*upscale_workers, return_exceptions=True)
 
